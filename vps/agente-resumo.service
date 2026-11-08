@@ -1,0 +1,24 @@
+[Unit]
+Description=Agente 1 - Resumo do WhatsApp (somente leitura)
+After=network-online.target
+
+[Service]
+User=agente
+Group=agente
+WorkingDirectory=/opt/agente-resumo
+EnvironmentFile=/etc/agente-resumo.env
+Environment=PATH=/home/agente/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -X utf8 /opt/agente-resumo/interface/app.py --sem-navegador
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/agente
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

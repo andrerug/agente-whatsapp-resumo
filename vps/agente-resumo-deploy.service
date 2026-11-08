@@ -1,0 +1,8 @@
+[Unit]
+Description=Atualiza o Agente 1 a partir do GitHub (somente leitura)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/agente-resumo/vps/atualizar.sh
+TimeoutStartSec=300

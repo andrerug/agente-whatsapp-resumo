@@ -1,0 +1,9 @@
+[Unit]
+Description=Confere o GitHub a cada 2 minutos e atualiza o Agente 1
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

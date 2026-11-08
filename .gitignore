@@ -1,0 +1,18 @@
+# Binários do wacli: baixados da release oficial (openclaw/wacli), não versionados
+bin/wacli
+bin/wacli.exe
+
+# Nunca versionar: sessão do WhatsApp, mensagens, senhas, variáveis
+.wacli/
+*.db
+*.db-*
+*.env
+.env*
+*.sqlite*
+
+# Python
+__pycache__/
+*.pyc
+
+# Local
+.claude/settings.local.json

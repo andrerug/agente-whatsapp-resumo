@@ -1,0 +1,55 @@
+{
+  "env": {
+    "WACLI_READONLY": "1"
+  },
+  "permissions": {
+    "allow": [
+      "PowerShell(*wacli* chats list*)",
+      "PowerShell(*wacli* chats show*)",
+      "PowerShell(*wacli* messages list*)",
+      "PowerShell(*wacli* messages search*)",
+      "PowerShell(*wacli* messages show*)",
+      "PowerShell(*wacli* messages context*)",
+      "PowerShell(*wacli* groups list*)",
+      "PowerShell(*wacli* history coverage*)",
+      "PowerShell(*wacli* auth status*)",
+      "Bash(*wacli* chats list*)",
+      "Bash(*wacli* chats show*)",
+      "Bash(*wacli* messages list*)",
+      "Bash(*wacli* messages search*)",
+      "Bash(*wacli* messages show*)",
+      "Bash(*wacli* messages context*)",
+      "Bash(*wacli* groups list*)",
+      "Bash(*wacli* history coverage*)",
+      "Bash(*wacli* auth status*)"
+    ],
+    "deny": [
+      "PowerShell(*wacli* send*)",
+      "PowerShell(*wacli* messages delete*)",
+      "PowerShell(*wacli* messages edit*)",
+      "PowerShell(*wacli* messages forward*)",
+      "PowerShell(*wacli* messages revoke*)",
+      "PowerShell(*wacli* chats mark-*)",
+      "PowerShell(*wacli* chats archive*)",
+      "PowerShell(*wacli* groups create*)",
+      "PowerShell(*wacli* groups leave*)",
+      "PowerShell(*wacli* presence*)",
+      "PowerShell(*wacli* profile*)",
+      "PowerShell(*wacli* auth logout*)",
+      "PowerShell(*WACLI_READONLY*)",
+      "Bash(*wacli* send*)",
+      "Bash(*wacli* messages delete*)",
+      "Bash(*wacli* messages edit*)",
+      "Bash(*wacli* messages forward*)",
+      "Bash(*wacli* messages revoke*)",
+      "Bash(*wacli* chats mark-*)",
+      "Bash(*wacli* chats archive*)",
+      "Bash(*wacli* groups create*)",
+      "Bash(*wacli* groups leave*)",
+      "Bash(*wacli* presence*)",
+      "Bash(*wacli* profile*)",
+      "Bash(*wacli* auth logout*)",
+      "Bash(*WACLI_READONLY*)"
+    ]
+  }
+}

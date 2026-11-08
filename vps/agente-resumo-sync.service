@@ -1,0 +1,10 @@
+[Unit]
+Description=Baixa mensagens novas do WhatsApp (agente 1, sem envio)
+
+[Service]
+Type=oneshot
+User=agente
+Environment=WACLI_STORE_DIR=/home/agente/.wacli
+ExecStart=/opt/agente-resumo/bin/wacli sync --once --idle-exit 15s
+TimeoutStartSec=600
+NoNewPrivileges=true
