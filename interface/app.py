@@ -15,6 +15,8 @@ import hmac
 import json
 import mimetypes
 import os
+import re
+import shutil
 import secrets
 import time
 import subprocess
@@ -93,15 +95,250 @@ def resumir_com_claude(texto, foco):
     return saida
 
 
+# ------------------------------------------------------------------ instâncias (números de WhatsApp)
+# Cada número fica numa pasta própria do wacli. O número que já existia continua em WACLI_STORE_DIR
+# (id "principal"); os novos ficam em INSTANCIAS_DIR/<id>/store, com um instancia.json só com o nome.
+# Conectar um número só faz o pareamento (QR ou código) e baixa o histórico: nada é enviado.
+
+STORE_PRINCIPAL = Path(os.environ.get("WACLI_STORE_DIR") or Path.home() / ".wacli")
+INSTANCIAS_DIR = Path(os.environ.get("INSTANCIAS_DIR") or Path.home() / ".wacli-instancias")
+NOME_PRINCIPAL = os.environ.get("NOME_PRINCIPAL", "Número principal")
+ID_OK = re.compile(r"^[a-z0-9-]{1,40}$")
+CONEXOES = {}  # id -> conexão em andamento (QR ou código)
+TRAVA_CONEXOES = threading.Lock()
+ESPERA_LEITURA = 180     # segundos para ler o QR ou digitar o código no celular
+LIMITE_SINCRONIA = 900   # depois de conectado, tempo máximo da primeira sincronização
+EVENTOS_DE_ESPERA = {"auth_starting", "warning", "qr_code", "pair_code", "error", "signal"}
+
+
+def _ler_meta(pasta):
+    try:
+        return json.loads((pasta / "instancia.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _gravar_meta(pasta, meta):
+    (pasta / "instancia.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+
+def _inst(iid, pasta):
+    meta = _ler_meta(pasta)
+    return {"id": iid, "nome": meta.get("nome") or iid, "store": pasta / "store", "nova": bool(meta.get("nova"))}
+
+
+def lista_instancias():
+    itens = []
+    if (STORE_PRINCIPAL / "session.db").exists():
+        itens.append({"id": "principal", "nome": NOME_PRINCIPAL, "store": STORE_PRINCIPAL, "nova": False})
+    if INSTANCIAS_DIR.is_dir():
+        pastas = [p for p in INSTANCIAS_DIR.iterdir() if p.is_dir() and ID_OK.match(p.name) and (p / "instancia.json").exists()]
+        for pasta in sorted(pastas, key=lambda p: _ler_meta(p).get("criada", "")):
+            itens.append(_inst(pasta.name, pasta))
+    return itens
+
+
+def achar_instancia(iid):
+    if iid == "principal":
+        return {"id": "principal", "nome": NOME_PRINCIPAL, "store": STORE_PRINCIPAL, "nova": False}
+    pasta = INSTANCIAS_DIR / (iid or "")
+    if not ID_OK.match(iid or "") or not (pasta / "instancia.json").exists():
+        raise RuntimeError("Número não encontrado. Volte para a lista de números.")
+    return _inst(iid, pasta)
+
+
+def final_do_numero(fone):
+    d = re.sub(r"\D", "", (fone or "").split("@")[0].split(":")[0])
+    return d[-4:] if len(d) >= 4 else ""
+
+
+def estado_instancia(inst):
+    """Estado de um número: conectado, desconectado, aguardando (QR na tela) ou sincronizando."""
+    base = {"id": inst["id"], "nome": inst["nome"], "final": "", "conectado": False, "estado": "desconectado"}
+    c = CONEXOES.get(inst["id"])
+    if c and c["estado"] in ("aguardando", "sincronizando"):
+        base["estado"] = c["estado"]
+        base["conectado"] = c["estado"] == "sincronizando"
+        return base
+    try:
+        d = (wa.wacli("auth", "status", store=inst["store"]) if inst["store"].exists() else {}) or {}
+    except Exception:
+        d = {}
+    base["conectado"] = bool(d.get("authenticated"))
+    base["final"] = final_do_numero(d.get("phone") or d.get("linked_jid"))
+    base["estado"] = "conectado" if base["conectado"] else "desconectado"
+    return base
+
+
+def instancias_publicas():
+    return [estado_instancia(i) for i in lista_instancias()]
+
+
+def criar_instancia(nome):
+    nome = " ".join(str(nome or "").split())[:60]
+    if not nome:
+        raise RuntimeError("Dê um nome para o número. Exemplo: Celular do protocolo.")
+    import unicodedata
+    simples = unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode().lower()
+    base = re.sub(r"[^a-z0-9]+", "-", simples).strip("-")[:24] or "numero"
+    iid = f"{base}-{secrets.token_hex(2)}"
+    pasta = INSTANCIAS_DIR / iid
+    (pasta / "store").mkdir(parents=True, exist_ok=False)
+    for p in (INSTANCIAS_DIR, pasta, pasta / "store"):
+        try:
+            os.chmod(p, 0o700)
+        except Exception:
+            pass
+    _gravar_meta(pasta, {"nome": nome, "criada": datetime.now().isoformat(timespec="seconds"), "nova": True})
+    return {"id": iid, "nome": nome}
+
+
+def _marcar_conectada(iid):
+    if iid == "principal":
+        return
+    pasta = INSTANCIAS_DIR / iid
+    meta = _ler_meta(pasta)
+    if meta.get("nova"):
+        meta.pop("nova", None)
+        _gravar_meta(pasta, meta)
+
+
+def _descartar_se_nunca_conectou(iid):
+    """Número criado agora que não chegou a conectar não tem mensagem nenhuma: sai da lista."""
+    if iid == "principal":
+        return
+    pasta = INSTANCIAS_DIR / iid
+    if _ler_meta(pasta).get("nova") and pasta.parent == INSTANCIAS_DIR and ID_OK.match(pasta.name):
+        shutil.rmtree(pasta, ignore_errors=True)
+
+
+def conectar(iid, modo, telefone=""):
+    inst = achar_instancia(iid)
+    with TRAVA_CONEXOES:
+        atual = CONEXOES.get(iid)
+        if atual and atual["estado"] in ("aguardando", "sincronizando"):
+            return conexao_publica(iid)
+        if estado_instancia(inst)["conectado"]:
+            raise RuntimeError("Este número já está conectado.")
+        args = [wa.WACLI, "--events", "--store", str(inst["store"]), "auth", "--history-days", "30", "--idle-exit", "30s"]
+        if modo == "telefone":
+            fone = re.sub(r"\D", "", telefone or "")
+            if not 12 <= len(fone) <= 15:
+                raise RuntimeError("Digite o número com 55, o DDD e o número, só algarismos. Exemplo: 5591988887777.")
+            args += ["--phone", fone]
+        else:
+            modo = "qr"
+            args += ["--qr-format", "text"]
+        inst["store"].mkdir(parents=True, exist_ok=True)
+        env = {k: v for k, v in os.environ.items() if k not in ("WACLI_READONLY", "WACLI_STORE_DIR")}
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        c = {"proc": proc, "modo": modo, "estado": "aguardando", "qr": "", "codigo": "", "erro": "",
+             "inicio": time.time(), "lido_em": None, "nova": inst["nova"]}
+        CONEXOES[iid] = c
+    threading.Thread(target=_acompanhar, args=(iid, c, inst), daemon=True).start()
+    return conexao_publica(iid)
+
+
+def _acompanhar(iid, c, inst):
+    proc = c["proc"]
+
+    def vigia():  # encerra se ninguém ler o QR a tempo ou se a primeira sincronização passar do limite
+        while proc.poll() is None:
+            agora = time.time()
+            if c["estado"] == "aguardando" and agora - c["inicio"] > ESPERA_LEITURA:
+                c["erro"] = c["erro"] or "O tempo acabou antes de o celular confirmar."
+                proc.terminate()
+            elif c["estado"] == "sincronizando" and agora - (c["lido_em"] or agora) > LIMITE_SINCRONIA:
+                proc.terminate()
+            time.sleep(2)
+    threading.Thread(target=vigia, daemon=True).start()
+
+    for bruta in proc.stderr:
+        try:
+            ev = json.loads(bruta.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        nome, dados = ev.get("event"), ev.get("data") or {}
+        if nome == "qr_code":
+            c["qr"] = dados.get("code", "")
+        elif nome == "pair_code":
+            c["codigo"] = dados.get("code", "")
+        elif nome == "error":
+            msg = dados.get("message", "")
+            if c["estado"] == "aguardando" and not c["erro"] and "context canceled" not in msg:
+                c["erro"] = msg
+        elif nome not in EVENTOS_DE_ESPERA and c["estado"] == "aguardando":
+            # Qualquer outro evento só vem depois que o celular aceitou: começou a primeira sincronização.
+            c.update(estado="sincronizando", lido_em=time.time(), qr="", codigo="")
+            _marcar_conectada(iid)
+    proc.wait()
+    try:
+        ok = bool((wa.wacli("auth", "status", store=inst["store"]) or {}).get("authenticated"))
+    except Exception:
+        ok = False
+    if ok:
+        c["estado"] = "conectado"
+        _marcar_conectada(iid)
+    else:
+        c["estado"] = "erro"
+        c["erro"] = c["erro"] or "A conexão não foi concluída."
+        if c["nova"]:
+            _descartar_se_nunca_conectou(iid)
+
+
+def conexao_publica(iid):
+    c = CONEXOES.get(iid)
+    if not c:
+        return {"estado": "nenhuma"}
+    restante = max(0, int(ESPERA_LEITURA - (time.time() - c["inicio"]))) if c["estado"] == "aguardando" else None
+    return {"estado": c["estado"], "modo": c["modo"], "qr": c["qr"], "codigo": c["codigo"], "erro": c["erro"],
+            "restante": restante, "descartada": c["estado"] == "erro" and c["nova"]}
+
+
+def cancelar(iid):
+    c = CONEXOES.get(iid)
+    if c and c["proc"].poll() is None and c["estado"] == "aguardando":
+        c["erro"] = "Conexão cancelada."
+        c["proc"].terminate()
+        try:
+            c["proc"].wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            c["proc"].kill()
+        c["estado"] = "erro"  # a lista já sai certa, sem esperar a outra thread
+        if c["nova"]:
+            _descartar_se_nunca_conectou(iid)
+    elif not c:
+        try:
+            if achar_instancia(iid)["nova"]:
+                _descartar_se_nunca_conectou(iid)
+        except RuntimeError:
+            pass
+    return {"ok": True}
+
+
+def sincronizar_todas():
+    """Usado pelo timer da VPS: baixa as mensagens novas de cada número conectado. Não envia nada."""
+    for inst in lista_instancias():
+        if not estado_instancia(inst)["conectado"]:
+            print(f"{inst['nome']}: desconectado, pulando")
+            continue
+        try:
+            atualizar(inst)
+            print(f"{inst['nome']}: atualizado")
+        except Exception as e:
+            print(f"{inst['nome']}: {e}")
+
+
 # ------------------------------------------------------------------ dados
 
-def conversas(busca="", nao_lidas=False, limite=200):
+def conversas(store, busca="", nao_lidas=False, limite=200):
     args = ["chats", "list", "--limit", str(limite)]
     if busca:
         args += ["--query", busca]
     if nao_lidas:
         args += ["--unread"]
-    lista = wa.wacli(*args) or []
+    lista = wa.wacli(*args, store=store) or []
     return [
         {"jid": c.get("jid"), "nome": c.get("name") or c.get("jid"),
          "tipo": {"group": "grupo", "dm": "contato"}.get(c.get("kind"), c.get("kind") or ""),
@@ -110,14 +347,14 @@ def conversas(busca="", nao_lidas=False, limite=200):
     ]
 
 
-def mensagens(jid, depois_de, limite=300):
+def mensagens(store, jid, depois_de, limite=300):
     if jid == "*":
         args = ["messages", "list", "--from-them", "--after", depois_de, "--limit", str(limite)]
         varias = True
     else:
         args = ["messages", "list", "--chat", jid, "--after", depois_de, "--limit", str(limite)]
         varias = False
-    msgs, mais, sync = wa.lista_mensagens(wa.wacli(*args))
+    msgs, mais, sync = wa.lista_mensagens(wa.wacli(*args, store=store))
     itens = []
     for m in reversed(msgs):
         if m.get("ReactionEmoji"):
@@ -134,20 +371,18 @@ def mensagens(jid, depois_de, limite=300):
 
 
 def status():
-    try:
-        d = wa.wacli("auth", "status") or {}
-        conectado = bool(d.get("authenticated"))
-    except Exception:
-        conectado = False
-    return {"conectado": conectado, "claude": bool(achar_claude())}
+    return {"claude": bool(achar_claude())}
 
 
-def atualizar():
+def atualizar(inst):
+    c = CONEXOES.get(inst["id"])
+    if c and c["estado"] in ("aguardando", "sincronizando"):
+        raise RuntimeError("Este número ainda está terminando a conexão. Espere alguns minutos.")
     if not TRAVA_SYNC.acquire(blocking=False):
         raise RuntimeError("Já existe uma atualização em andamento.")
     try:
         env = {k: v for k, v in os.environ.items() if k != "WACLI_READONLY"}
-        env["WACLI_STORE_DIR"] = os.environ.get("WACLI_STORE_DIR") or str(Path.home() / ".wacli")
+        env["WACLI_STORE_DIR"] = str(inst["store"])
         proc = subprocess.run([wa.WACLI, "sync", "--once", "--idle-exit", "15s"], capture_output=True, env=env,
                               timeout=600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if proc.returncode != 0:
@@ -175,7 +410,7 @@ def senha_confere(senha):
         return False
 
 
-ESTATICOS = {"/av/av.css", "/av/fontes/archivo-latin-variavel.woff2"}
+ESTATICOS = {"/av/av.css", "/av/fontes/archivo-latin-variavel.woff2", "/av/qrcode.js"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -241,10 +476,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"erro": "SENHA"}, 401)
             if u.path == "/api/status":
                 return self._json(status())
+            if u.path == "/api/instancias":
+                return self._json(instancias_publicas())
+            if u.path == "/api/conexao":
+                return self._json(conexao_publica(q.get("inst", "")))
             if u.path == "/api/conversas":
-                return self._json(conversas(q.get("busca", ""), q.get("nao_lidas") == "1"))
+                inst = achar_instancia(q.get("inst", ""))
+                return self._json(conversas(inst["store"], q.get("busca", ""), q.get("nao_lidas") == "1"))
             if u.path == "/api/mensagens":
-                return self._json(mensagens(q["jid"], data_inicio(q.get("periodo", "24h"))))
+                inst = achar_instancia(q.get("inst", ""))
+                return self._json(mensagens(inst["store"], q["jid"], data_inicio(q.get("periodo", "24h"))))
             return self._json({"erro": "não encontrado"}, 404)
         except Exception as e:
             return self._json({"erro": str(e)}, 500)
@@ -266,15 +507,22 @@ class Handler(BaseHTTPRequestHandler):
         if not self._sessao_ok():
             return self._json({"erro": "SENHA"}, 401)
         try:
+            if self.path == "/api/instancias":
+                return self._json(criar_instancia(dados.get("nome")))
+            if self.path == "/api/conectar":
+                return self._json(conectar(str(dados.get("inst", "")), dados.get("modo"), str(dados.get("telefone", ""))))
+            if self.path == "/api/cancelar":
+                return self._json(cancelar(str(dados.get("inst", ""))))
             if self.path == "/api/resumir":
-                m = mensagens(dados["jid"], data_inicio(dados.get("periodo", "24h")))
+                inst = achar_instancia(str(dados.get("inst", "")))
+                m = mensagens(inst["store"], dados["jid"], data_inicio(dados.get("periodo", "24h")))
                 if not m["itens"]:
                     return self._json({"resumo": "_Nenhuma mensagem nesse período._", "qtd": 0})
                 nome = dados.get("nome") or ""
                 texto = m["texto"] if dados["jid"] == "*" else f"Conversa: {nome}\n\n{m['texto']}"
                 return self._json({"resumo": resumir_com_claude(texto, dados.get("foco", "")), "qtd": len(m["itens"])})
             if self.path == "/api/atualizar":
-                return self._json(atualizar())
+                return self._json(atualizar(achar_instancia(str(dados.get("inst", "")))))
             return self._json({"erro": "não encontrado"}, 404)
         except Exception as e:
             return self._json({"erro": str(e)}, 500)
@@ -321,4 +569,9 @@ def criar_senha():
 
 
 if __name__ == "__main__":
-    criar_senha() if "--criar-senha" in sys.argv else main()
+    if "--criar-senha" in sys.argv:
+        criar_senha()
+    elif "--sincronizar-todas" in sys.argv:
+        sincronizar_todas()
+    else:
+        main()

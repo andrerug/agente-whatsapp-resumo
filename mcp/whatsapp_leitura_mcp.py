@@ -33,11 +33,12 @@ PERMITIDOS = {
 
 # ---------------------------------------------------------------- wacli
 
-def wacli(*args):
+def wacli(*args, store=None):
     if tuple(args[:2]) not in PERMITIDOS:
         raise RuntimeError(f"comando não permitido: {args[:2]}")
     # Fixa a pasta do número pessoal: mesmo que exista outra conta (ex.: "demo"), este agente só lê esta.
-    env = dict(os.environ, WACLI_READONLY="1", WACLI_STORE_DIR=os.environ.get("WACLI_STORE_DIR") or str(Path.home() / ".wacli"))
+    # A interface pode passar outra pasta (store) para ler outro número; continua só leitura.
+    env = dict(os.environ, WACLI_READONLY="1", WACLI_STORE_DIR=str(store or os.environ.get("WACLI_STORE_DIR") or Path.home() / ".wacli"))
     proc = subprocess.run(
         [WACLI, "--read-only", "--json", *args],
         capture_output=True, env=env, timeout=120,

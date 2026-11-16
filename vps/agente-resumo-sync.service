@@ -1,10 +1,10 @@
 [Unit]
-Description=Baixa mensagens novas do WhatsApp (agente 1, sem envio)
+Description=Baixa mensagens novas de todos os numeros do WhatsApp (agente 1, sem envio)
 
 [Service]
 Type=oneshot
 User=agente
 Environment=WACLI_STORE_DIR=/home/agente/.wacli
-ExecStart=/opt/agente-resumo/bin/wacli sync --once --idle-exit 15s
-TimeoutStartSec=600
+ExecStart=/usr/bin/python3 -X utf8 /opt/agente-resumo/interface/app.py --sincronizar-todas
+TimeoutStartSec=1800
 NoNewPrivileges=true
